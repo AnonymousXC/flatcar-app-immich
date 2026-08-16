@@ -1,0 +1,156 @@
+name: Validate Butane Config
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'butane/**'
+      - 'scripts/**'
+      - '.github/workflows/validate-butane.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'butane/**'
+      - 'scripts/**'
+      - '.github/workflows/validate-butane.yml'
+
+env:
+  BUTANE_VERSION: v0.22.0
+  IGNITION_VERSION: v2.19.0
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Butane
+        run: |
+          curl -L -o butane "https://github.com/coreos/butane/releases/download/${BUTANE_VERSION}/butane-x86_64-unknown-linux-gnu"
+          chmod +x butane
+          sudo mv butane /usr/local/bin/
+          butane --version
+
+      - name: Install Ignition Validator
+        run: |
+          curl -L -o ignition-validate "https://github.com/coreos/ignition/releases/download/${IGNITION_VERSION}/ignition-validate-x86_64-linux"
+          chmod +x ignition-validate
+          sudo mv ignition-validate /usr/local/bin/
+          ignition-validate --version
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Validate Butane Syntax
+        run: butane --strict butane/immich.bu > /dev/null
+
+      - name: Generate Ignition Config
+        run: |
+          mkdir -p ignition
+          butane --strict butane/immich.bu > ignition/immich.ign
+
+      - name: Validate Ignition Config
+        run: ignition-validate ignition/immich.ign
+
+      - name: Check Ignition is Valid JSON
+        run: python3 -c "import json; json.load(open('ignition/immich.ign'))"
+
+      - name: Flatcar-Specific Checks
+        run: |
+          python3 << 'PYEOF'
+          import yaml
+          import sys
+
+          with open('butane/immich.bu') as f:
+              config = yaml.safe_load(f)
+
+          errors = []
+          warnings = []
+
+          for f in config.get('storage', {}).get('files', []):
+              path = f.get('path', '')
+              if path.startswith('/usr/local/'):
+                  errors.append(f"{path}: /usr/local is read-only in Flatcar.")
+
+          for f in config.get('storage', {}).get('files', []):
+              path = f.get('path', '')
+              if path.startswith('/etc/') and not f.get('overwrite', False):
+                  errors.append(f"{path}: missing 'overwrite: true'.")
+
+          for unit in config.get('systemd', {}).get('units', []):
+              name = unit.get('name', 'unknown')
+              contents = unit.get('contents', '')
+              for line in contents.split('\n'):
+                  line = line.strip()
+                  if not line.startswith(('ExecStart=', 'ExecStop=', 'ExecStopPost=', 'ExecStartPre=')):
+                      continue
+                  # Remove systemd's "-" failure-prefix
+                  value = line.lstrip('-').split('=', 1)[1] if '=' in line else ''
+                  shell_ops = ['||', '&&', '2>', '| ']
+                  if any(op in value for op in shell_ops) and '/bin/sh -c' not in value:
+                      errors.append(f"{name}: Shell operators require '/bin/sh -c' wrapper: {line.strip()}")
+
+          script_paths = [f.get('path') for f in config.get('storage', {}).get('files', []) if f.get('path', '').startswith('/opt/bin/')]
+          dir_paths = [d.get('path') for d in config.get('storage', {}).get('directories', [])]
+          if script_paths and '/opt/bin' not in dir_paths:
+              errors.append("/opt/bin is used for files but not declared in storage.directories")
+
+          if errors:
+              print("\n".join(errors))
+              sys.exit(1)
+
+          print("All Flatcar-specific checks passed!")
+          PYEOF
+
+      - name: Lint Inline Shell Scripts
+        run: |
+          python3 << 'PYEOF'
+          import yaml
+          import subprocess
+          import tempfile
+          import os
+
+          with open('butane/immich.bu') as f:
+              config = yaml.safe_load(f)
+
+          errors = []
+          for f in config.get('storage', {}).get('files', []):
+              path = f.get('path', '')
+              inline = f.get('contents', {}).get('inline', '')
+              if not inline:
+                  continue
+              # Lint anything in /opt/bin or ending in .sh
+              if path.startswith('/opt/bin/') or path.endswith('.sh'):
+                  with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as tmp:
+                      tmp.write(inline)
+                      tmp_name = tmp.name
+                  result = subprocess.run(['shellcheck', tmp_name], capture_output=True, text=True)
+                  os.unlink(tmp_name)
+                  if result.returncode != 0:
+                      errors.append(f"shellcheck failed for {path}:\n{result.stdout}")
+
+          if errors:
+              print("\n".join(errors))
+              exit(1)
+
+          print("All inline scripts passed shellcheck!")
+          PYEOF
+
+      - name: Lint External Shell Scripts
+        run: |
+          if [ -d scripts ]; then
+            for script in scripts/*.sh; do
+              [ -e "$script" ] || continue
+              shellcheck "$script" && echo "$script"
+            done
+          else
+            echo "No scripts/ directory found, skipping."
+          fi
+
+      - name: Upload Ignition Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immich-ignition
+          path: ignition/immich.ign
+          retention-days: 7
